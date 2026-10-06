@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# claude-account: keep several Claude logins on this host and pick which one board
+# agent runs use. Tokens come from `claude setup-token` (long-lived, never refreshed,
+# so no run can write an old account back over a switch).
+#
+# Store (ubuntu only, 700/600; never print the .token files):
+#   ~/.config/claude-accounts/<name>.token   one CLAUDE_CODE_OAUTH_TOKEN value
+#   ~/.config/claude-accounts/active         the active name; missing = "default"
+# "default" is the normal login in ~/.claude/.credentials.json (no token set).
+# The board worker reads `active` per spawn and sets CLAUDE_CODE_OAUTH_TOKEN for
+# new runs only; runs already going keep the account they started with.
+set -euo pipefail
+
+DIR="${CLAUDE_ACCOUNTS_DIR:-$HOME/.config/claude-accounts}"
+NAME_RE='^[a-z0-9][a-z0-9_-]{0,31}$'
+
+die() { echo "claude-account: $*" >&2; exit 1; }
+usage() {
+  cat <<'EOF'
+Usage: claude-account <command>
+
+  list [--json]        accounts, the active one marked (no token values)
+  current              print the active account name
+  add <name>           store a token from `claude setup-token` (prompted, hidden; or on stdin)
+  use <name|default>   make it the account new board agent runs use
+  rm <name>            delete a stored token (switches to default if it was active)
+  check [name]         prove the account works with one tiny Haiku request (default: active)
+  run [name] -- cmd…   run one command as that account (e.g. run personal -- claude)
+
+"default" is the normal login (~/.claude/.credentials.json).
+EOF
+}
+
+init() { umask 077; mkdir -p "$DIR"; chmod 700 "$DIR"; }
+valid() { [[ $1 =~ $NAME_RE && $1 != default ]] || die "bad name '$1' (a-z 0-9 _ -, max 32, not 'default')"; }
+exists() { [[ $1 == default || -f $DIR/$1.token ]]; }
+active() {
+  local a=""
+  [[ -f $DIR/active ]] && a=$(tr -d '[:space:]' <"$DIR/active")
+  if [[ -z $a ]] || ! exists "$a"; then a=default; fi
+  echo "$a"
+}
+names() { local f; for f in "$DIR"/*.token; do [[ -e $f ]] && basename "$f" .token; done; return 0; }
+set_active() { init; local t; t=$(mktemp "$DIR/.active.XXXXXX"); echo "$1" >"$t"; mv -f "$t" "$DIR/active"; }
+# Exec a command with the account's auth in its env (token for named, none for default).
+with_account() {
+  local n=$1; shift
+  if [[ $n == default ]]; then exec env -u CLAUDE_CODE_OAUTH_TOKEN "$@"; fi
+  CLAUDE_CODE_OAUTH_TOKEN=$(<"$DIR/$n.token") exec "$@"
+}
+
+cmd=${1:-}; shift || true
+case $cmd in
+  list|ls)
+    a=$(active)
+    if [[ ${1:-} == --json ]]; then
+      python3 - "$a" "$DIR" $(names) <<'PY'
+import json, os, sys, datetime
+a, d, *ns = sys.argv[1:]
+def item(n):
+    out = {"name": n, "active": n == a}
+    if n != "default":
+        out["added"] = datetime.datetime.fromtimestamp(os.path.getmtime(f"{d}/{n}.token"), datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return out
+print(json.dumps({"active": a, "accounts": [item("default")] + [item(n) for n in ns]}))
+PY
+    else
+      for n in default $(names); do
+        mark=" "; [[ $n == "$a" ]] && mark="*"
+        if [[ $n == default ]]; then echo "$mark default  (normal login, ~/.claude/.credentials.json)"
+        else echo "$mark $n  (token added $(date -u -r "$DIR/$n.token" +%F))"; fi
+      done
+    fi ;;
+  current) active ;;
+  add)
+    n=${1:-}; [[ -n $n ]] || die "usage: add <name>"; valid "$n"; init
+    if [[ -t 0 ]]; then
+      echo "Run \`claude setup-token\` (signed in to the account you want), then paste the token."
+      read -rsp "Token: " tok
+      # setup-token wraps the token over two lines; a pasted wrap arrives as more
+      # lines right behind the first, so keep reading until the paste stops.
+      while IFS= read -rs -t 1 more; do tok+=$more; done; echo
+    else
+      tok=$(cat)
+    fi
+    tok=$(tr -d '[:space:]' <<<"$tok")
+    [[ $tok == sk-ant-oat* ]] || die "that doesn't look like a setup-token token (sk-ant-oat…); nothing saved"
+    t=$(mktemp "$DIR/.tok.XXXXXX"); printf '%s' "$tok" >"$t"; chmod 600 "$t"; mv -f "$t" "$DIR/$n.token"
+    echo "saved '$n' (${#tok} chars); testing it…"; unset tok
+    if "$0" check "$n"; then echo "switch with: claude-account use $n"
+    else echo "not usable yet; re-copy the whole token (it wraps over 2 lines) and run add again" >&2; exit 1; fi ;;
+  use)
+    n=${1:-}; [[ -n $n ]] || die "usage: use <name|default>"
+    exists "$n" || die "no account '$n' (see: claude-account list)"
+    # A bad token fails every agent run in seconds, so refuse it (--force skips the test).
+    if [[ $n != default && ${2:-} != --force ]] && ! "$0" check "$n" >/dev/null; then
+      die "'$n' fails its test request (see: claude-account check $n); staying on $(active)"
+    fi
+    set_active "$n"; echo "active: $n (new board agent runs; running ones keep their account)" ;;
+  rm|remove)
+    n=${1:-}; [[ -n $n ]] || die "usage: rm <name>"; valid "$n"; exists "$n" || die "no account '$n'"
+    [[ $(active) == "$n" ]] && set_active default && echo "active was '$n'; now default"
+    rm -f -- "$DIR/$n.token"; echo "removed '$n'" ;;
+  check)
+    n=${1:-$(active)}; exists "$n" || die "no account '$n'"
+    # `auth status` trusts any token string, so prove it with one tiny Haiku call.
+    out=$( (with_account "$n" claude -p "Reply with just OK" --model claude-haiku-4-5-20251001 \
+      --output-format json --tools "" </dev/null) 2>&1 ) || true
+    if python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(1 if d.get("is_error") else 0)' "$out" 2>/dev/null
+    then echo "ok: '$n' signs in and answers"
+    else
+      echo "FAILED: '$n' could not run a request:"
+      python3 -c 'import json,sys; print(str(json.loads(sys.argv[1]).get("result"))[:300])' "$out" 2>/dev/null || head -c 300 <<<"$out"
+      exit 1
+    fi ;;
+  run)
+    n=$(active)
+    if [[ ${1:-} != -- && -n ${1:-} ]]; then n=$1; shift; fi
+    [[ ${1:-} == -- ]] && shift
+    [[ $# -gt 0 ]] || die "usage: run [name] -- command…"
+    exists "$n" || die "no account '$n'"
+    with_account "$n" "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
